@@ -66,18 +66,16 @@ jobs:
           echo "SCRATCH_ORG_ID=${SCRATCH_ORG_ID}" >> "$GITHUB_ENV"
 
       - name: Make the org Busbar-ready, establish trust, and register with the Hub
+        # sf-busbar-setup mints its OWN, independent OIDC session for the Hub
+        # registration step (via its hub-instance-url input) — it does not read
+        # the BUSBAR_HUB_ACCESS_TOKEN/BUSBAR_HUB_INSTANCE_URL captured above;
+        # those are only for this job's own later PATCH steps.
         uses: busbar-actions/sf-busbar-setup@main
         with:
           busbar-package: latest
           github-package: latest
           trust-specs: 'busbar-trust.json'
           hub-instance-url: ${{ vars.BUSBAR_HUB_INSTANCE_URL }}
-        env:
-          # sf-busbar-setup reads SF_ACCESS_TOKEN/SF_INSTANCE_URL (the new org,
-          # its primary target) plus BUSBAR_HUB_ACCESS_TOKEN/BUSBAR_HUB_INSTANCE_URL
-          # (the Hub, for the new registration step) simultaneously.
-          BUSBAR_HUB_ACCESS_TOKEN: ${{ env.BUSBAR_HUB_ACCESS_TOKEN }}
-          BUSBAR_HUB_INSTANCE_URL: ${{ env.BUSBAR_HUB_INSTANCE_URL }}
 
       # Runner's job stops at Trusted — Salesforce dispatches and watches the
       # delivery run itself (docs/architecture/ephemeral-org-provisioning.md,
