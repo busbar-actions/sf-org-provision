@@ -1,0 +1,116 @@
+name: 'Busbar Provision (fork/create -> ephemeral org)'
+description: >
+  Runner half of the fork-triggered ephemeral-org pipeline documented in
+  busbar-broker-sf's docs/architecture/ephemeral-org-provisioning.md. Fired by
+  a GithubRepositoryDispatchAction/GithubOrgProvisionProvider dispatch from
+  Salesforce (busbar_provision event_type). Creates the org, makes it
+  Busbar-ready, registers it with the Hub, and reports Trusted status back —
+  Salesforce takes over from there (dispatches + watches the delivery run).
+  No secrets are set on the created GitHub Environment; the org connects back
+  to Salesforce purely via GitHub OIDC, matching the product's zero-trust
+  design. Org info is written as a non-secret Environment VARIABLE only, for
+  convenience.
+
+on:
+  repository_dispatch:
+    types: [busbar_provision]
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      CORRELATION_KEY: ${{ github.event.client_payload.correlationKey }}
+      ENV_NAME: eph-${{ github.event.client_payload.correlationKey }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Authenticate to the Hub FIRST — org-auth always writes SF_ACCESS_TOKEN /
+      # SF_INSTANCE_URL, which would otherwise collide with (and be overwritten
+      # by) the scratch-org session extracted below. Capture it under distinct
+      # names immediately so both sessions can coexist for the rest of the job.
+      - name: Authenticate to the Hub (busbar-demo-pilot)
+        uses: busbar-actions/org-auth@main
+        with:
+          target-instance: ${{ vars.BUSBAR_HUB_INSTANCE_URL }}
+
+      - name: Preserve the Hub session under distinct names
+        run: |
+          echo "::add-mask::${SF_ACCESS_TOKEN}"
+          echo "BUSBAR_HUB_ACCESS_TOKEN=${SF_ACCESS_TOKEN}" >> "$GITHUB_ENV"
+          echo "BUSBAR_HUB_INSTANCE_URL=${SF_INSTANCE_URL}" >> "$GITHUB_ENV"
+
+      - name: Create the scratch org
+        id: create
+        uses: busbar-actions/sf-org-create@main
+        with:
+          target-instance: ${{ vars.BUSBAR_HUB_INSTANCE_URL }}
+          org-name: ${{ env.ENV_NAME }}
+          admin-email: ${{ vars.BUSBAR_DEMO_ADMIN_EMAIL }}
+          org-type: scratch
+          duration-days: '1'
+          snapshot: ${{ github.event.client_payload.shape }}
+          credentials-output: '.busbar/scratch-credentials.json'
+
+      - name: Extract the new org's bootstrap credentials
+        run: |
+          CREDS_FILE=".busbar/scratch-credentials.json"
+          ACCESS_TOKEN=$(jq -r '.access_token' "$CREDS_FILE")
+          INSTANCE_URL=$(jq -r '.instance_url' "$CREDS_FILE")
+          SCRATCH_ORG_ID=$(jq -r '.scratch_org_id' "$CREDS_FILE")
+          echo "::add-mask::${ACCESS_TOKEN}"
+          echo "SF_ACCESS_TOKEN=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
+          echo "SF_INSTANCE_URL=${INSTANCE_URL}" >> "$GITHUB_ENV"
+          echo "SCRATCH_ORG_ID=${SCRATCH_ORG_ID}" >> "$GITHUB_ENV"
+
+      - name: Make the org Busbar-ready, establish trust, and register with the Hub
+        uses: busbar-actions/sf-busbar-setup@main
+        with:
+          busbar-package: latest
+          github-package: latest
+          trust-specs: 'busbar-trust.json'
+          hub-instance-url: ${{ vars.BUSBAR_HUB_INSTANCE_URL }}
+        env:
+          # sf-busbar-setup reads SF_ACCESS_TOKEN/SF_INSTANCE_URL (the new org,
+          # its primary target) plus BUSBAR_HUB_ACCESS_TOKEN/BUSBAR_HUB_INSTANCE_URL
+          # (the Hub, for the new registration step) simultaneously.
+          BUSBAR_HUB_ACCESS_TOKEN: ${{ env.BUSBAR_HUB_ACCESS_TOKEN }}
+          BUSBAR_HUB_INSTANCE_URL: ${{ env.BUSBAR_HUB_INSTANCE_URL }}
+
+      # Runner's job stops at Trusted — Salesforce dispatches and watches the
+      # delivery run itself (docs/architecture/ephemeral-org-provisioning.md,
+      # revised: the runner no longer self-reports Delivering/Ready/Failed).
+      - name: Report Trusted status back to Salesforce (native external-id upsert, no new endpoint)
+        run: |
+          curl -sf -X PATCH \
+            "${BUSBAR_HUB_INSTANCE_URL}/services/data/v61.0/sobjects/busbar__EphemeralEnv__c/busbar__CorrelationKey__c/${CORRELATION_KEY}" \
+            -H "Authorization: Bearer ${BUSBAR_HUB_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"busbar__Status__c\":\"Trusted\",\"busbar__ScratchOrgId__c\":\"${SCRATCH_ORG_ID}\",\"busbar__InstanceUrl__c\":\"${SF_INSTANCE_URL}\",\"busbar__GithubEnvironmentName__c\":\"${ENV_NAME}\"}"
+
+      - name: Record org info as a non-secret Environment variable
+        # No secrets are written to the Environment — the org authenticates back
+        # to Salesforce via GitHub OIDC only. This is a convenience value for a
+        # delivery workflow step that wants to log/display the target instance.
+        run: |
+          gh variable set SF_INSTANCE_URL --env "${ENV_NAME}" --body "${SF_INSTANCE_URL}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: On failure, report back to Salesforce so EphemeralEnv__c does not hang in Provisioning
+        if: failure()
+        run: |
+          curl -sf -X PATCH \
+            "${BUSBAR_HUB_INSTANCE_URL}/services/data/v61.0/sobjects/busbar__EphemeralEnv__c/busbar__CorrelationKey__c/${CORRELATION_KEY}" \
+            -H "Authorization: Bearer ${BUSBAR_HUB_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"busbar__Status__c\":\"Failed\",\"busbar__LastError__c\":\"Provisioning run failed — see ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            || true
+
+      - name: Cleanup bootstrap credentials
+        if: always()
+        run: |
+          echo "SF_ACCESS_TOKEN=" >> "$GITHUB_ENV"
+          echo "BUSBAR_HUB_ACCESS_TOKEN=" >> "$GITHUB_ENV"
