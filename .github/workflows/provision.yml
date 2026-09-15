@@ -153,10 +153,27 @@ jobs:
           # GitHub Environment name; constrain it so neither can be traversed.
           [[ "${PAYLOAD_CORRELATION_KEY}" =~ ^[A-Za-z0-9._-]{8,200}$ ]] \
             || fail "client_payload.correlationKey is missing or contains characters that are illegal in a REST path segment / GitHub Environment name."
-          [[ "${PAYLOAD_PROVISION_FOR}" =~ ^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$ ]] \
-            || fail "client_payload.provisionFor must be owner/repo. Got: '${PAYLOAD_PROVISION_FOR}'."
-          [[ "${PAYLOAD_REF}" =~ ^refs/[A-Za-z0-9._/-]{1,240}$ ]] \
-            || fail "client_payload.ref must be a full git ref (refs/heads/…). Got: '${PAYLOAD_REF}'."
+          # provisionFor names the repo that gh-env-scratch-save opens a GitHub
+          # Environment in, under a Busbar-App installation token carrying
+          # administration:write. It is caller-supplied, so match GitHub's OWN
+          # naming rules rather than a loose character class: an owner is
+          # alphanumeric-or-hyphen (never a dot), and neither component may be
+          # `.` or `..`, which reqwest/curl would normalise away and re-point
+          # the API call at a different resource.
+          #   ⚠️ This is a SHAPE check, not an authorization check. Nothing here
+          #   decides WHICH repository this run may provision for — the
+          #   authorization for the repository dimension belongs in the org-side
+          #   GithubActionAllowlist__mdt gate (defect D2). Until that lands, any
+          #   caller who can reach ProvisionEphemeralOrgAction picks this value.
+          [[ "${PAYLOAD_PROVISION_FOR}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}$ ]] \
+            || fail "client_payload.provisionFor must be owner/repo using GitHub's own naming rules. Got: '${PAYLOAD_PROVISION_FOR}'."
+          repo_part="${PAYLOAD_PROVISION_FOR#*/}"
+          [[ "${repo_part}" != "." && "${repo_part}" != ".." ]] \
+            || fail "client_payload.provisionFor has a relative-path repository component ('${repo_part}'), which would re-target the GitHub API call."
+          # A `..` SEGMENT in the ref would be normalised out of any URL built
+          # from it; git forbids it in a ref name anyway (git-check-ref-format).
+          [[ "${PAYLOAD_REF}" =~ ^refs/[A-Za-z0-9._/-]{1,240}$ && "${PAYLOAD_REF}" != *".."* ]] \
+            || fail "client_payload.ref must be a full git ref (refs/heads/…) with no '..' segment. Got: '${PAYLOAD_REF}'."
 
           # Publish the correlation key AS SOON AS it is known — before the
           # config checks below, which are the ones most likely to fail on a
@@ -171,6 +188,15 @@ jobs:
             || fail "BUSBAR_ACTION_VERSION is empty — every action would silently resolve 'latest', which predates the in-process setup phase and would produce an untrusted, package-less org on a GREEN run."
           [[ "${BUSBAR_ACTION_VERSION}" != "latest" ]] \
             || fail "BUSBAR_ACTION_VERSION is 'latest'. actions-dist 'Latest' is 0.0.31 (2026-07-04); sf-org-create's setup phase landed 2026-07-11 and would be silently ignored."
+          # Honest accounting: `nightly` is a MOVING tag whose assets are
+          # overwritten in place (they were last rebuilt 2026-07-24). It is the
+          # only published tag that carries the setup phase today, so it is what
+          # we pin to — but it is NOT a reproducible pin, and a rebuild can
+          # change this workflow's behaviour with no change to this file. Say so
+          # in the run log rather than letting the word "pinned" imply more.
+          if [[ "${BUSBAR_ACTION_VERSION}" == "nightly" ]]; then
+            echo "::warning::BUSBAR_ACTION_VERSION='nightly' is a mutable tag — reproducible only until actions-dist rebuilds it. Move to an immutable semver tag as soon as one ships with sf-org-create's in-process setup phase."
+          fi
 
           [[ "${BUSBAR_CORE_PACKAGE}"   =~ ^04t[A-Za-z0-9]{12,15}$ ]] \
             || fail "BUSBAR_CORE_PACKAGE ('${BUSBAR_CORE_PACKAGE}') is not a 04t SubscriberPackageVersionId. It is sent verbatim as SubscriberPackageVersionKey — an alias cannot work."
@@ -330,12 +356,31 @@ jobs:
           credentials-output: ${{ steps.preflight.outputs.credentials_file }}
           version: ${{ env.BUSBAR_ACTION_VERSION }}
 
+      # ── THE STANDING REGRESSION TEST FOR D4. ─────────────────────────────
+      # DO NOT rewrite this as `grep "$GITHUB_ENV"` / `grep "$GITHUB_OUTPUT"`.
+      # Those two variables name files that are **unique to the step that reads
+      # them** — the runner hands every step a fresh, empty pair and processes
+      # them after that step ends. Grepping them here therefore greps THIS
+      # step's own empty files: it can never see what `create` published, and it
+      # can never see a handoff written by any other step. It passes always, for
+      # everything, which is strictly worse than having no check at all.
+      #
+      # What IS observable across steps is the RESULT of those files:
+      #   • a prior step's $GITHUB_ENV entries arrive as real environment
+      #     variables in this step's process env  → check the variables; and
+      #   • a prior step's $GITHUB_OUTPUT entries arrive in the `steps.<id>`
+      #     context → check `toJSON(steps.<id>.outputs)`.
+      # Both are checked below, so re-introducing the D4 handoff (any step that
+      # copies the new org's `.access_token` into $GITHUB_ENV, or an `org-auth`
+      # moved earlier in the job) fails the build here.
       - name: Assert no credential material escaped the org-create step
         shell: bash
         env:
           CREATED_ORG_ID: ${{ steps.create.outputs.scratch_org_id }}
           CREATED_ORG_INFO_ID: ${{ steps.create.outputs.scratch_org_info_id }}
           CREATED_USERNAME: ${{ steps.create.outputs.username }}
+          # The values GitHub actually recorded for the steps that ran so far.
+          RECORDED_OUTPUTS: ${{ toJSON(steps.preflight.outputs) }}${{ toJSON(steps.trust.outputs) }}${{ toJSON(steps.create.outputs) }}
         run: |
           set -euo pipefail
 
@@ -343,23 +388,33 @@ jobs:
           [[ -n "${CREATED_ORG_INFO_ID}" ]] || { echo "::error::Missing scratch_org_info_id"; exit 1; }
           [[ -n "${CREATED_USERNAME}" ]]    || { echo "::error::Missing username";            exit 1; }
 
-          # Step outputs are visible to every later step AND to any caller of
-          # this workflow. Nothing credential-shaped belongs in them.
-          if grep -qiE 'access_token|refresh_token|client_secret' "$GITHUB_OUTPUT"; then
-            echo "::error::SECURITY: credential material found in GITHUB_OUTPUT"
+          # 1. NO SALESFORCE SESSION IN THE JOB ENVIRONMENT YET.
+          #    `org-auth` — the one deliberate handoff — runs LAST, after this
+          #    step, so anything here came from a step that should not have put
+          #    it here. This is also what enforces the ordering invariant the
+          #    file header describes: busbar-auth's local-dev fast path
+          #    (busbar-auth/src/lib.rs:86-99) hijacks every later binary's auth
+          #    the moment SF_ACCESS_TOKEN + SF_INSTANCE_URL are both ambient.
+          leaked=''
+          for name in SF_ACCESS_TOKEN SF_REFRESH_TOKEN SF_AUTH_URL SFDX_AUTH_URL SF_INSTANCE_URL; do
+            if [[ -n "$(printenv "${name}" || true)" ]]; then
+              leaked="${leaked} ${name}"
+            fi
+          done
+          if [[ -n "${leaked}" ]]; then
+            echo "::error::SECURITY (D4 regression): Salesforce session state reached the job environment before the report-back step —${leaked}. SF_ACCESS_TOKEN + SF_INSTANCE_URL together switch every later busbar binary onto the local-dev fast path, so BOTH are treated as leaks: the new org's admin session must never be handed off, and no binary may run against an ambient instance URL it did not choose."
             exit 1
           fi
 
-          # The regression test for this file's whole reason to exist. Until
-          # `org-auth` runs (the last non-cleanup step), NO Salesforce session
-          # may exist in the job environment — and the new org's admin token in
-          # particular must never appear here at all.
-          if [[ -s "$GITHUB_ENV" ]] && grep -qiE 'SF_ACCESS_TOKEN|access_token|refresh_token' "$GITHUB_ENV"; then
-            echo "::error::SECURITY: a Salesforce session was written to GITHUB_ENV before the report-back step. The new org's admin session must never be handed off."
+          # 2. NOTHING CREDENTIAL-SHAPED IN ANY STEP OUTPUT. Step outputs are
+          #    visible to every later step and to any caller of this workflow.
+          #    `00D…!…` is the shape of a Salesforce session id.
+          if grep -qiE 'access_token|refresh_token|client_secret|force://|00D[A-Za-z0-9]{12,15}!' <<< "${RECORDED_OUTPUTS}"; then
+            echo "::error::SECURITY: credential material found in a step output"
             exit 1
           fi
 
-          echo "✓ no credential material in GITHUB_OUTPUT or GITHUB_ENV"
+          echo "✓ no Salesforce session in the job environment, and no credential material in any step output"
 
       # Opens the ephemeral Environment in the repo being provisioned FOR — the
       # repo the delivery workflow runs in, which is NOT necessarily this repo
@@ -397,6 +452,22 @@ jobs:
       # sf-org-create already self-deletes when ITS OWN later phases fail
       # (verification / settings / setup), so this is the backstop for a failure
       # AFTER a fully-successful create — e.g. the environment step above.
+      #
+      # The step below makes "MUST run before org-auth" a MACHINE-CHECKED fact
+      # rather than a comment: it is the only failure-path step that can prove
+      # sf-org-delete is about to self-mint. A comment does not survive the next
+      # edit; this does.
+      - name: 'On failure: prove the Dev Hub delete will self-mint, not inherit a session'
+        if: ${{ failure() && steps.create.outputs.scratch_org_info_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$(printenv SF_ACCESS_TOKEN || true)" || -n "$(printenv SF_INSTANCE_URL || true)" ]]; then
+            echo "::error::SECURITY: a Salesforce session is already ambient in the job environment, so the sf-org-delete step below would run against IT (busbar-auth local-dev fast path) instead of OIDC-minting its own Dev Hub session. Move org-auth back after this step."
+            exit 1
+          fi
+          echo "✓ no ambient session — sf-org-delete will OIDC-mint its own Dev Hub session"
+
       - name: 'On failure: delete the scratch so a late failure does not leak a Dev Hub slot'
         if: ${{ failure() && steps.create.outputs.scratch_org_info_id != '' }}
         uses: busbar-actions/sf-org-delete@main
