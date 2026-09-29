@@ -5,9 +5,11 @@
 # Fired by GithubOrgProvisionProvider.dispatch() as a `busbar_provision`
 # repository_dispatch. Creates a scratch org, makes it Busbar-ready, publishes
 # the per-run OIDC trust rule the delivery workflow will authenticate with,
-# registers the org with the Hub, opens the ephemeral GitHub Environment in the
-# repo being provisioned FOR, and reports `Trusted` back to Salesforce. Then it
-# stops — Salesforce owns everything from `Delivering` onward.
+# registers the org with the Hub, and reports `Trusted` back to Salesforce with
+# the new org's non-secret identifiers. Then it stops — Salesforce owns
+# everything from there, including opening the ephemeral GitHub Environment in
+# the repo being provisioned FOR (through the org's own GitHub App, whose
+# private key never leaves Salesforce).
 #
 # SECURITY SHAPE (this is the whole point of the file — do not regress it):
 #
@@ -37,6 +39,15 @@
 #     query/deploy/test only — so this deliberate handoff is the shape that
 #     exists. Replace it the day one lands.)
 #
+#   • This workflow holds NO GitHub credential beyond its own GITHUB_TOKEN
+#     (contents: read, to download the pinned binaries) and writes nothing to
+#     GitHub. It does not open the ephemeral GitHub Environment: it reports
+#     the identifiers the Environment needs (InstanceUrl__c, ScratchOrgId__c,
+#     GithubEnvironmentName__c, and ScratchOrgUsername__c where the installed
+#     busbar-github has it) in the same PATCH that sets `Trusted`, and
+#     Salesforce opens the Environment with its GitHub App installation
+#     token. So there is no GitHub App private key in this repo's secrets.
+#
 #   • No secret is ever written to the ephemeral GitHub Environment. The
 #     delivery workflow authenticates into the new org purely by GitHub OIDC,
 #     matched against the trust rule this run publishes.
@@ -63,15 +74,17 @@ jobs:
 
     # ── REQUIREMENT: the Environment IS how this workflow addresses an org. ──
     # Two things come off it, and both are part of the authorization decision:
-    #   1. the config below (`vars.*` / `secrets.*`) — so the same workflow
-    #      file points at a different Hub by pointing at a different
-    #      Environment, never by editing a typed-in instance URL; and
+    #   1. the config below (`vars.*` only: this job reads no secrets), so
+    #      the same workflow file points at a different Hub by pointing at a
+    #      different Environment, never by editing a typed-in instance URL; and
     #   2. the `environment` CLAIM in this job's GitHub OIDC token. The Hub's
     #      TrustPolicy for this workflow pins `environment = hub`, so a job
     #      that forgot this line cannot authenticate at all — which is the
     #      correct failure, not an inconvenience.
     environment: hub
 
+    # These are the only two GitHub permissions the job has. There is no
+    # GitHub App key and no PAT: nothing in this job writes to GitHub.
     permissions:
       contents: read # `setup` downloads the pinned binary from actions-dist
       id-token: write # the OIDC token every busbar binary self-mints from
@@ -97,10 +110,14 @@ jobs:
       # (sf-busbar-setup/src/ops/package.rs:110-118). There is no alias
       # resolution anywhere in that path, so a friendly word like `latest`
       # is submitted as a package version id and the install fails.
-      # Released 2026-09-02; both are RELEASED (promoted) versions, which is
-      # what a non-scratch subscriber org requires.
-      BUSBAR_CORE_PACKAGE: '04tam000006bRSPAA2' # busbar (core)      0.1.0.14
-      BUSBAR_GITHUB_PACKAGE: '04tam000006bRsDAAU' # busbar-github      0.1.0.13
+      # Both are RELEASED (promoted), and are the versions the Hub/Dev Hub
+      # (busbar-demo-pilot) itself runs, so leaf and Hub speak the same
+      # contract. busbar-github 0.2.0.1 depends on core 0.2.0.1 and on Nebula
+      # Logger 04tg70000000r5xAAA, which sf-busbar-setup installs first.
+      # busbar-hub is deliberately NOT installed: the new org is a LEAF
+      # (governed) org, and only a governor installs the Hub package.
+      BUSBAR_CORE_PACKAGE: '04tam000006bvWvAAI' # busbar (core)      0.2.0.1
+      BUSBAR_GITHUB_PACKAGE: '04tam000006bva9AAA' # busbar-github      0.2.0.1
 
       # busbar-auth reads these directly (busbar-auth/src/config.rs:52-58).
       # Empty values fall back to the binary's baked defaults.
@@ -136,9 +153,9 @@ jobs:
     steps:
       # NOTE: deliberately NO actions/checkout. Nothing in this job reads the
       # repository tree — the trust spec is rendered per-run into RUNNER_TEMP
-      # (below), because the one claim that matters most, `environment`, names
-      # an ephemeral environment that cannot exist in a file committed ahead of
-      # time. A checked-in `busbar-trust.json` would be a stale rule at best.
+      # (below), because its `repository` and `ref` claims name the fork being
+      # provisioned FOR, which cannot exist in a file committed ahead of time.
+      # A checked-in `busbar-trust.json` would be a stale rule at best.
 
       - name: Preflight — validate the config and the untrusted dispatch payload (fail closed)
         id: preflight
@@ -153,13 +170,12 @@ jobs:
           # GitHub Environment name; constrain it so neither can be traversed.
           [[ "${PAYLOAD_CORRELATION_KEY}" =~ ^[A-Za-z0-9._-]{8,200}$ ]] \
             || fail "client_payload.correlationKey is missing or contains characters that are illegal in a REST path segment / GitHub Environment name."
-          # provisionFor names the repo that gh-env-scratch-save opens a GitHub
-          # Environment in, under a Busbar-App installation token carrying
-          # administration:write. It is caller-supplied, so match GitHub's OWN
-          # naming rules rather than a loose character class: an owner is
-          # alphanumeric-or-hyphen (never a dot), and neither component may be
-          # `.` or `..`, which reqwest/curl would normalise away and re-point
-          # the API call at a different resource.
+          # provisionFor becomes the `repository` claim of the trust rule this
+          # run publishes into the new org, i.e. the repo whose delivery
+          # workflow may authenticate there. It is caller-supplied, so match
+          # GitHub's OWN naming rules rather than a loose character class: an
+          # owner is alphanumeric-or-hyphen (never a dot), and neither
+          # component may be `.` or `..`.
           #   ⚠️ This is a SHAPE check, not an authorization check. Nothing here
           #   decides WHICH repository this run may provision for — the
           #   authorization for the repository dimension belongs in the org-side
@@ -224,10 +240,18 @@ jobs:
             || fail "The 'hub' Environment must define BUSBAR_DELIVERY_WORKFLOW as the delivery workflow's file BASENAME — no directory, no .yml (e.g. 'busbar-delivery'). It becomes the trust rule's 'workflow' claim; without it the new org would be unreachable. Got: '${DELIVERY_WORKFLOW}'."
 
           # --- derived ---------------------------------------------------------
-          # The ephemeral GitHub Environment name. It is pinned as the trust
-          # rule's `environment` claim AND stamped onto EphemeralEnv__c, so all
-          # three must agree exactly — derive it once, here.
-          env_name="eph-${PAYLOAD_CORRELATION_KEY}"
+          # The GitHub Environment name in the fork. It is pinned as the trust
+          # rule's `environment` claim AND stamped onto EphemeralEnv__c, and
+          # Salesforce creates the Environment under exactly that name, so all
+          # three must agree exactly — set it once, here.
+          #
+          # It is FIXED (`org`), not per-run: the Hub's Configure-Environment
+          # allowlist matches the target Environment name exactly, so the name
+          # has to be stable. That costs no isolation: each fork gets its own
+          # scratch org, and the trust rule in that org also pins the fork's
+          # `repository` and `ref`, so an `org` Environment in any other repo
+          # cannot authenticate there.
+          env_name="org"
           # ScratchOrgInfo.OrgName is capped at 80 chars; the correlation key is
           # a 64-char hex digest, so truncate for the org NAME only (never for
           # the environment name, which is the trust claim).
@@ -240,6 +264,19 @@ jobs:
           # sf-org-create's `snapshot` input wants the BARE name — passing the
           # prefixed form through, as this workflow used to, asks the Dev Hub for
           # a snapshot literally named "snapshot:bbpkgbase".
+          #
+          # A BLANK or ABSENT shape (the policy left ScratchDefinition__c empty;
+          # a JSON null renders as '') means a FRESH scratch org: a
+          # Developer-edition org built from nothing, no snapshot. That is the
+          # safe default, and what the demo uses.
+          #
+          # An inline scratch definition is REFUSED on purpose, and so is
+          # reading one from the fork. `shape` is dispatch payload, and the fork
+          # is attacker-controlled: org-base is public, so anyone can fork it.
+          # A definition chooses edition, features and a `settings` block that
+          # sf-org-create deploys with the new org's admin session, all paid for
+          # with this Dev Hub's scratch allocation. Only a snapshot NAME is
+          # accepted, which can only select something an admin already built.
           snapshot=""
           case "${PAYLOAD_SHAPE}" in
             "")         : ;;                                     # fresh org
@@ -258,6 +295,7 @@ jobs:
             echo "credentials_file=${RUNNER_TEMP}/scratch-credentials.json"
             echo "trust_spec_file=${RUNNER_TEMP}/busbar-trust.json"
             echo "report_body_file=${RUNNER_TEMP}/report-body.json"
+            echo "describe_file=${RUNNER_TEMP}/describe.json"
             echo "report_response_file=${RUNNER_TEMP}/report-response.json"
             echo "env_name=${env_name}"
             echo "org_name=${org_name}"
@@ -330,8 +368,10 @@ jobs:
       # the AuthCode-redeemed admin session, entirely inside this process
       # (sf-org-create/src/main.rs:523-577 → busbar_setup::run_setup). The
       # session is dropped when the binary exits; the only thing that survives
-      # is the credentials JSON below, which is read once by gh-env-scratch-save
-      # (for its NON-secret identifiers only) and then wiped.
+      # is the credentials JSON below, from which the report-back reads ONE
+      # non-secret value (`instance_url`) before the always() step wipes it.
+      # sf-org-create must NOT upload that file as an artifact
+      # (busbar-actions/sf-org-create#3): this repo is public.
       #
       # This replaces BOTH the old separate `sf-busbar-setup` step and the
       # credential-extraction step that copied the new org's access_token into
@@ -416,33 +456,6 @@ jobs:
 
           echo "✓ no Salesforce session in the job environment, and no credential material in any step output"
 
-      # Opens the ephemeral Environment in the repo being provisioned FOR — the
-      # repo the delivery workflow runs in, which is NOT necessarily this repo
-      # (ProvisioningPolicy__mdt.DispatchChannel__c can route the dispatch to a
-      # dedicated runner repo). The old `gh variable set --env` had no --repo and
-      # no `administration: write`, so it targeted the wrong repo with a token
-      # that could not have created the environment anyway.
-      #
-      # This writes VARIABLES ONLY — SF_INSTANCE_URL, SF_USERNAME, SF_LOGIN_URL,
-      # SF_SCRATCH_ORG_ID, SF_SCRATCH_ORG_INFO_ID (gh-env-scratch-save reads the
-      # credentials JSON but stores no token, refresh URL or credential context).
-      # The delivery workflow self-mints its own session by OIDC against
-      # SF_INSTANCE_URL, matched by the trust rule published above.
-      #
-      # Fail-closed: if the environment cannot be opened, the trust rule's
-      # `environment` claim can never be satisfied, so the org is useless and the
-      # failure path below reclaims it.
-      - name: Open the ephemeral GitHub Environment in ${{ steps.preflight.outputs.provision_for }} (no secrets, variables only)
-        id: save
-        uses: busbar-actions/gh-env-scratch-save@main
-        with:
-          credentials-path: ${{ steps.preflight.outputs.credentials_file }}
-          environment-name: ${{ steps.preflight.outputs.env_name }}
-          repository: ${{ steps.preflight.outputs.provision_for }}
-          github-app-id: ${{ vars.GH_APP_ID != '' && vars.GH_APP_ID || secrets.GH_APP_ID }}
-          github-app-private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          version: ${{ env.BUSBAR_ACTION_VERSION }}
-
       # ── Failure path, part 1: reclaim the Dev Hub slot. ───────────────────
       # MUST run before `org-auth`. sf-org-delete self-mints an OIDC session
       # against the Dev Hub — but only while SF_ACCESS_TOKEN is absent from the
@@ -451,7 +464,7 @@ jobs:
       #
       # sf-org-create already self-deletes when ITS OWN later phases fail
       # (verification / settings / setup), so this is the backstop for a failure
-      # AFTER a fully-successful create — e.g. the environment step above.
+      # AFTER a fully-successful create — e.g. the assertion step above.
       #
       # The step below makes "MUST run before org-auth" a MACHINE-CHECKED fact
       # rather than a comment: it is the only failure-path step that can prove
@@ -496,6 +509,16 @@ jobs:
           target-instance: ${{ env.HUB_INSTANCE_URL }}
           version: ${{ env.BUSBAR_ACTION_VERSION }}
 
+      # The PATCH carries every identifier Salesforce needs to open the
+      # ephemeral GitHub Environment in the fork itself:
+      #   InstanceUrl__c           → the Environment's SF_INSTANCE_URL variable
+      #   ScratchOrgId__c          → the new org's id (15-char)
+      #   ScratchOrgUsername__c    → the new org's admin username (sent only
+      #                              when the installed busbar-github has the
+      #                              field — see below)
+      #   GithubEnvironmentName__c → the Environment's NAME (`org`). It is also
+      #                              the `environment` claim of the trust rule
+      #                              this run published, so use it verbatim.
       - name: Report Trusted to Salesforce (native external-id upsert)
         if: ${{ success() && steps.auth.outcome == 'success' }}
         shell: bash
@@ -503,11 +526,14 @@ jobs:
           CORRELATION_KEY: ${{ steps.preflight.outputs.correlation_key }}
           ENV_NAME: ${{ steps.preflight.outputs.env_name }}
           SCRATCH_ORG_ID: ${{ steps.create.outputs.scratch_org_id }}
+          SCRATCH_USERNAME: ${{ steps.create.outputs.username }}
           CREDENTIALS_FILE: ${{ steps.preflight.outputs.credentials_file }}
+          DESCRIBE_FILE: ${{ steps.preflight.outputs.describe_file }}
           REPORT_BODY_FILE: ${{ steps.preflight.outputs.report_body_file }}
           REPORT_RESPONSE_FILE: ${{ steps.preflight.outputs.report_response_file }}
         run: |
           set -euo pipefail
+          sobject_url="${SF_INSTANCE_URL}/services/data/v${SF_API_VERSION}/sobjects/busbar__EphemeralEnv__c"
 
           # The new org's instance URL is a NON-secret identifier; read it out of
           # the credentials JSON rather than carrying it through the environment.
@@ -515,17 +541,46 @@ jobs:
           [[ -n "${instance_url}" && "${instance_url}" != "null" ]] \
             || { echo "::error::Could not read the new org's instance_url from the credentials file"; exit 1; }
 
+          # busbar__ScratchOrgUsername__c ships in a busbar-github release AFTER
+          # 0.2.0.1. Sending an unknown field makes the whole PATCH fail with
+          # 400 INVALID_FIELD, so ASK the org whether the field is there (and
+          # editable by this session — describe honours FLS) and send it only
+          # then. Chosen over "retry without it on 400": a retry would also
+          # swallow unrelated 400s and could mask a real mistake, and it
+          # doubles the writes. Chosen over a workflow variable: nobody has to
+          # remember to flip it when the Hub upgrades. Username is optional
+          # data, so a failed describe only drops it, with a warning.
+          send_username=false
+          describe_code="$(curl -sS \
+            -o "${DESCRIBE_FILE}" -w '%{http_code}' \
+            "${sobject_url}/describe" \
+            -H "Authorization: Bearer ${SF_ACCESS_TOKEN}")" || describe_code=000
+          if [[ "${describe_code}" =~ ^2 ]]; then
+            if jq -e '.fields[] | select(.name == "busbar__ScratchOrgUsername__c" and .updateable)' \
+                 "${DESCRIBE_FILE}" > /dev/null; then
+              send_username=true
+            else
+              echo "::notice::busbar__ScratchOrgUsername__c is not on EphemeralEnv__c (or not editable) in this Hub; reporting without the username."
+            fi
+          else
+            echo "::warning::Describe of EphemeralEnv__c failed (HTTP ${describe_code}); reporting without the username."
+          fi
+
           jq -n \
             --arg status "Trusted" \
             --arg orgId "${SCRATCH_ORG_ID}" \
             --arg instanceUrl "${instance_url}" \
             --arg envName "${ENV_NAME}" \
+            --arg username "${SCRATCH_USERNAME}" \
+            --argjson sendUsername "${send_username}" \
             '{
                "busbar__Status__c":                $status,
                "busbar__ScratchOrgId__c":          $orgId,
                "busbar__InstanceUrl__c":           $instanceUrl,
                "busbar__GithubEnvironmentName__c": $envName
-             }' > "${REPORT_BODY_FILE}"
+             }
+             + (if $sendUsername then { "busbar__ScratchOrgUsername__c": $username } else {} end)' \
+            > "${REPORT_BODY_FILE}"
 
           # PATCH-by-external-id is the platform's native idempotent upsert — no
           # bespoke endpoint, and safe to repeat on a webhook redelivery.
@@ -533,7 +588,7 @@ jobs:
           code="$(curl -sS \
             -o "${REPORT_RESPONSE_FILE}" -w '%{http_code}' \
             -X PATCH \
-            "${SF_INSTANCE_URL}/services/data/v${SF_API_VERSION}/sobjects/busbar__EphemeralEnv__c/busbar__CorrelationKey__c/${CORRELATION_KEY}" \
+            "${sobject_url}/busbar__CorrelationKey__c/${CORRELATION_KEY}" \
             -H "Authorization: Bearer ${SF_ACCESS_TOKEN}" \
             -H 'Content-Type: application/json' \
             --data-binary "@${REPORT_BODY_FILE}")"
@@ -610,7 +665,7 @@ jobs:
         if: always()
         shell: bash
         # The credentials file holds the new org's live admin token. It exists
-        # only so gh-env-scratch-save can read the NON-secret identifiers out of
+        # only so the report-back can read the NON-secret instance_url out of
         # it; past that point it is pure liability. Wipe by GLOB rather than by
         # the preflight's outputs alone, so a run that died BEFORE preflight
         # emitted them still gets cleaned.
@@ -620,5 +675,6 @@ jobs:
             "${RUNNER_TEMP}/scratch-credentials.json" \
             "${RUNNER_TEMP}/busbar-trust.json" \
             "${RUNNER_TEMP}/report-body.json" \
+            "${RUNNER_TEMP}/describe.json" \
             "${RUNNER_TEMP}/report-response.json"
           echo "✓ wiped credentials, trust spec and report bodies from ${RUNNER_TEMP}"
