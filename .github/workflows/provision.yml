@@ -116,8 +116,8 @@ jobs:
       # Logger 04tg70000000r5xAAA, which sf-busbar-setup installs first.
       # busbar-hub is deliberately NOT installed: the new org is a LEAF
       # (governed) org, and only a governor installs the Hub package.
-      BUSBAR_CORE_PACKAGE: '04tam000006bvWvAAI' # busbar (core)      0.2.0.1
-      BUSBAR_GITHUB_PACKAGE: '04tam000006bva9AAA' # busbar-github      0.2.0.1
+      BUSBAR_CORE_PACKAGE: '04tam000006c0ZpAAI' # busbar (core)      0.3.0.1
+      BUSBAR_GITHUB_PACKAGE: '04tam000006c0d3AAA' # busbar-github      0.4.0.1
 
       # busbar-auth reads these directly (busbar-auth/src/config.rs:52-58).
       # Empty values fall back to the binary's baked defaults.
