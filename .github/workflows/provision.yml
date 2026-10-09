@@ -812,7 +812,7 @@ jobs:
             jq -n --arg status "${PAYLOAD_FINAL_STATUS}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               '{ "busbar__Status__c": $status, "busbar__TornDownAt__c": $at }' > "${REPORT_BODY_FILE}"
           else
-            # Leave it Tearing_Down: the Hub's sweeper sends the teardown again.
+            # Leave it open (teardown still requested): the Hub's sweeper sends it again.
             jq -n --arg err "Teardown run failed — see ${RUN_URL}" \
               '{ "busbar__LastError__c": $err }' > "${REPORT_BODY_FILE}"
           fi
@@ -830,7 +830,7 @@ jobs:
           if [[ "${DELETE_OUTCOME}" == "success" ]]; then
             echo "✓ EphemeralEnv__c[${CORRELATION_KEY}] → ${PAYLOAD_FINAL_STATUS} (org deleted now: ${DELETED:-false})"
           else
-            echo "✓ EphemeralEnv__c[${CORRELATION_KEY}] told the teardown failed; it stays Tearing_Down for a retry"
+            echo "✓ EphemeralEnv__c[${CORRELATION_KEY}] told the teardown failed; it stays open for the sweeper to retry"
             exit 1
           fi
 
